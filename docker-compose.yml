@@ -1,0 +1,315 @@
+# PhishXGraph open-science reference pipeline.
+#
+# Shared volumes:
+#   ./data/features  — instrumentation cache (page.html + instrumentation.json)
+#   ./data/models    — trained classifier artifacts
+#   ./data/input     — URL lists (CSV with 'url' and optional 'label' columns)
+#   ./data/results   — scoring outputs + realtime hits
+#
+# Typical usage:
+#   docker compose run --rm collect
+#   docker compose run --rm train
+#   docker compose run --rm test
+#   docker compose up realtime   # detaches, run `docker compose logs -f realtime`
+
+services:
+  # 1) Crawl a URL list with Playwright + CDP (30s timeout per page).
+  collect:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.phishxgraph
+    image: phishxgraph:latest
+    volumes:
+      - ./data:/data
+      - ./phishxgraph:/app/phishxgraph:ro
+    environment:
+      - PYTHONPATH=/app
+    command: >
+      python -m phishxgraph.cli collect
+      --input /data/input/urls.csv
+      --features-dir /data/features
+      --timeout 30
+
+  # 2) Train XGBoost classifier on the cached features.
+  train:
+    image: phishxgraph:latest
+    depends_on:
+      - collect
+    volumes:
+      - ./data:/data
+      - ./phishxgraph:/app/phishxgraph:ro
+    environment:
+      - PYTHONPATH=/app
+    command: >
+      python -m phishxgraph.cli train
+      --input /data/input/urls.csv
+      --features-dir /data/features
+      --model-dir /data/models/phishxgraph
+      --classifier xgboost
+
+  # 3) Score a held-out URL list.
+  test:
+    image: phishxgraph:latest
+    depends_on:
+      - train
+    volumes:
+      - ./data:/data
+      - ./phishxgraph:/app/phishxgraph:ro
+    environment:
+      - PYTHONPATH=/app
+    command: >
+      python -m phishxgraph.cli test
+      --input /data/input/test_urls.csv
+      --features-dir /data/features
+      --model-dir /data/models/phishxgraph
+      --output /data/results/test_predictions.csv
+
+  # 4) Ablation study (paper §5.5, Table 7): feature-category × classifier.
+  ablation:
+    image: phishxgraph:latest
+    depends_on:
+      - train
+    volumes:
+      - ./data:/data
+      - ./phishxgraph:/app/phishxgraph:ro
+    environment:
+      - PYTHONPATH=/app
+    command: >
+      python -m phishxgraph.ablation
+      --train /data/input/urls.csv
+      --test  /data/input/test_urls.csv
+      --features-dir /data/features
+      --output /data/results/ablation.csv
+      --classifier xgboost
+
+  # 5a) Generate single-surface adversarial feature caches (§5.4).
+  #     10 attacks × 6 variants each → data/evasion_features/single/
+  evasion-generate:
+    image: phishxgraph:latest
+    depends_on:
+      - collect
+    volumes:
+      - ./data:/data
+      - ./phishxgraph:/app/phishxgraph:ro
+      - ./evasion:/app/evasion:ro
+    environment:
+      - PYTHONPATH=/app
+    command: >
+      python -m evasion.generate
+      --input        /data/input/test_evasion.csv
+      --features-dir /data/features
+      --output-dir   /data/evasion_features/single
+      --attacks      all
+      --workers      4
+
+  # 5b) (Optional) generate paper Table 6 combo caches (URL+HTML, …).
+  evasion-generate-combos:
+    image: phishxgraph:latest
+    depends_on:
+      - evasion-generate
+    volumes:
+      - ./data:/data
+      - ./phishxgraph:/app/phishxgraph:ro
+      - ./evasion:/app/evasion:ro
+    environment:
+      - PYTHONPATH=/app
+    command: >
+      python -m evasion.generate_combos
+      --input        /data/input/test_evasion.csv
+      --features-dir /data/features
+      --output-dir   /data/evasion_features/combo
+
+  # 5c) Score PhishXGraph on the adversarial caches (§5.4 ASR).
+  evasion-score:
+    image: phishxgraph:latest
+    depends_on:
+      - evasion-generate
+      - train
+    volumes:
+      - ./data:/data
+      - ./phishxgraph:/app/phishxgraph:ro
+      - ./evasion:/app/evasion:ro
+    environment:
+      - PYTHONPATH=/app
+    command: >
+      python -m evasion.score
+      --test        /data/input/test_evasion.csv
+      --attacks-dir /data/evasion_features/single
+      --model-dir   /data/models/phishxgraph
+      --output      /data/results/evasion_phishxgraph.csv
+
+  # 5d) Collapse per-variant ASR into Table 6's surface + combo columns.
+  evasion-aggregate:
+    image: phishxgraph:latest
+    depends_on:
+      - evasion-score
+    volumes:
+      - ./data:/data
+      - ./evasion:/app/evasion:ro
+    environment:
+      - PYTHONPATH=/app
+    command: >
+      python -m evasion.aggregate
+      --input  /data/results/evasion_phishxgraph.csv
+      --output /data/results/table6.csv
+
+  # 6) Realtime worker: subscribes to CertStream, scores newly issued
+  #    hostnames, and compares PhishXGraph's detection time against
+  #    OpenPhish/PhishTank/GSB listings (paper §5.6).
+  #    Use --fallback-ct-logs if CertStream is unreachable.
+  #    Set GOOGLE_API_KEY for the GSB comparison (optional).
+  realtime:
+    image: phishxgraph:latest
+    depends_on:
+      - train
+    volumes:
+      - ./data:/data
+      - ./phishxgraph:/app/phishxgraph:ro
+    environment:
+      - PYTHONPATH=/app
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - PHISHTANK_KEY=${PHISHTANK_KEY:-}
+    command: >
+      python -m phishxgraph.realtime
+      --model-dir /data/models/phishxgraph
+      --features-dir /data/features
+      --output /data/results/realtime_hits.csv
+      --threshold 0.7
+      --timeout 30
+    restart: unless-stopped
+
+  # 7) Deferred blacklist re-scan — catches URLs that appear on
+  #    OpenPhish/PhishTank/GSB *after* detection. Run periodically to
+  #    fill in `earliest_blacklist` / `lead_minutes` for rows detected
+  #    earlier. Safe to run alongside `realtime`.
+  realtime-rescan:
+    image: phishxgraph:latest
+    volumes:
+      - ./data:/data
+      - ./phishxgraph:/app/phishxgraph:ro
+    environment:
+      - PYTHONPATH=/app
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - PHISHTANK_KEY=${PHISHTANK_KEY:-}
+    command: >
+      python -m phishxgraph.rescan
+      --input  /data/results/realtime_hits.csv
+      --output /data/results/realtime_hits.csv
+      --interval 900
+
+  # 8) Summarize realtime logs into §5.6 headline numbers.
+  realtime-stats:
+    image: phishxgraph:latest
+    volumes:
+      - ./data:/data
+      - ./phishxgraph:/app/phishxgraph:ro
+    environment:
+      - PYTHONPATH=/app
+    command: >
+      python -m phishxgraph.realtime_stats
+      --input  /data/results/realtime_hits.csv
+      --output /data/results/realtime_stats.csv
+
+  # =========================================================================
+  # 9) The five paper baselines (§5.3, Table 5)
+  # ---------------------------------------------------------------------
+  # Each runs the same MODE envvar-driven pattern as PhishXGraph itself.
+  #   docker compose run --rm -e MODE=train urlnet
+  #   docker compose run --rm -e MODE=test  urlnet
+  # The baseline's Docker image fetches its upstream code from the
+  # original author's GitHub (documented inside each Dockerfile); this
+  # release provides only the thin wrapper that plugs the upstream model
+  # into the shared data/features/ cache.
+  # =========================================================================
+
+  urlnet:
+    build:
+      context: ./baselines/urlnet
+    volumes:
+      - ./data:/data
+    environment:
+      - INPUT_CSV=/data/input/phishinglist.csv
+      - OUTPUT_DIR=/data/results/urlnet
+      - MODEL_DIR=/data/models/urlnet
+      - FEATURES_DIR=${FEATURES_DIR:-/data/features}
+      - MODE=${MODE:-test}
+
+  lbp:
+    build:
+      context: ./baselines/lbp
+    volumes:
+      - ./data:/data
+    environment:
+      - INPUT_CSV=/data/input/phishinglist.csv
+      - OUTPUT_DIR=/data/results/lbp
+      - MODEL_DIR=/data/models/lbp
+      - FEATURES_DIR=${FEATURES_DIR:-/data/features}
+      - MODE=${MODE:-test}
+
+  stackmodel:
+    build:
+      context: ./baselines/stackmodel
+    volumes:
+      - ./data:/data
+    environment:
+      - INPUT_CSV=/data/input/phishinglist.csv
+      - OUTPUT_DIR=/data/results/stackmodel
+      - MODEL_DIR=/data/models/stackmodel
+      - FEATURES_DIR=${FEATURES_DIR:-/data/features}
+      - MODE=${MODE:-test}
+
+  bpe:
+    build:
+      context: ./baselines/bpe
+    volumes:
+      - ./data:/data
+    environment:
+      - INPUT_CSV=/data/input/phishinglist.csv
+      - OUTPUT_DIR=/data/results/bpe
+      - MODEL_DIR=/data/models/bpe
+      - FEATURES_DIR=${FEATURES_DIR:-/data/features}
+      - MODE=${MODE:-test}
+
+  # Vision baselines — require GPU + pretrained weights.
+  # Run `scripts/download_pretrained.sh all` once before first test.
+  phishpedia:
+    build:
+      context: ./baselines/phishpedia
+    volumes:
+      - ./data:/data
+      - ./models/phishpedia/pretrained:/app/phishpedia/_pretrained_src:ro
+    environment:
+      - INPUT_CSV=/data/input/phishinglist.csv
+      - OUTPUT_DIR=/data/results/phishpedia
+      - MODEL_DIR=/data/models/phishpedia
+      - FEATURES_DIR=${FEATURES_DIR:-/data/features}
+      - MODE=${MODE:-test}
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  phishintention:
+    build:
+      context: ./baselines/phishintention
+    volumes:
+      - ./data:/data
+      - ./models/phishintention/pretrained:/app/phishintention/_pretrained_src:ro
+    environment:
+      - INPUT_CSV=/data/input/phishinglist.csv
+      - OUTPUT_DIR=/data/results/phishintention
+      - MODEL_DIR=/data/models/phishintention
+      - FEATURES_DIR=${FEATURES_DIR:-/data/features}
+      - MODE=${MODE:-test}
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

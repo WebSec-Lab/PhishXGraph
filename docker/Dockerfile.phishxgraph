@@ -1,0 +1,33 @@
+# PhishXGraph reference container.
+# Supports: collect (Playwright+CDP), train, test, ablation,
+# evasion generate/score/aggregate, realtime worker.
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Playwright Chromium runtime deps + OpenCV runtime deps (for the logo-
+# based adversarial attacks A8/A9/A10) on Debian bookworm.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git \
+        libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+        libdbus-1-3 libxkbcommon0 libatspi2.0-0 libx11-6 libxcomposite1 \
+        libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
+        libcairo2 libasound2 libdrm2 libxshmfence1 \
+        libglib2.0-0 libsm6 libxrender1 \
+        fonts-dejavu-core fonts-liberation fonts-noto-core \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install -r /app/requirements.txt \
+ && python -m playwright install chromium
+
+COPY phishxgraph /app/phishxgraph
+COPY evasion     /app/evasion
+ENV PYTHONPATH=/app
+
+CMD ["python", "-m", "phishxgraph.cli", "--help"]

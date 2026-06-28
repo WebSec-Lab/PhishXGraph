@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use PhishXGraph, please cite the paper below."
+title: "PhishXGraph: Robust Phishing Website Detection using Cross-Layer Interaction Graphs"
+authors:
+  - family-names: "Bae"
+    given-names: "Jaeho"
+    affiliation: "UNIST"
+  - family-names: "Kim"
+    given-names: "Junghoon"
+    affiliation: "UNIST"
+  - family-names: "Kim"
+    given-names: "Doowon"
+    affiliation: "University of Tennessee, Knoxville"
+  - family-names: "Wi"
+    given-names: "Seongil"
+    affiliation: "UNIST"
+year: 2026
+preferred-citation:
+  type: conference-paper
+  title: "PhishXGraph: Robust Phishing Website Detection using Cross-Layer Interaction Graphs"
+  authors:
+    - family-names: "Bae"
+      given-names: "Jaeho"
+    - family-names: "Kim"
+      given-names: "Junghoon"
+    - family-names: "Kim"
+      given-names: "Doowon"
+    - family-names: "Wi"
+      given-names: "Seongil"
+  year: 2026

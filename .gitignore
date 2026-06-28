@@ -1,0 +1,27 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local virtualenvs
+.venv/
+venv/
+
+# Generated smoke/test artifacts
+data/smoke/
+!data/smoke/.gitkeep
+
+# Local overrides
+.env
+*.local
+
+# Runtime-fetched data
+data/features/
+data/models/
+data/results/
+!data/samples/
+!data/samples/**
+
+# Playwright browsers cache (only when bind-mounted)
+ms-playwright/
